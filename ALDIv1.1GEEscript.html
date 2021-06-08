@@ -1,0 +1,188 @@
+// Define parameters //////////////////////
+var AOIpoint = table; //MAKE SURE YOU IMPORT the AOI shapefile and label it table
+var cloudthresh=70; //default (and first runs) used 50
+var NDSIthresh=0.5;//define an NDSI threshold to mask snowy pixels, higher values allow inclusion of snowier pixels lower values are a stricter mask
+var t_thresh = -3.106; //define t-test threshold, for 11 deg freedom (n months - 1), crit vals: alpha,t; 0.1,1.796; 0.05,2.179; 0.01,3.106
+var alpha=1; //exponent for NDVIdifference term in ALDI
+var beta=1; //exponent for post-event median NDVI in ALDI
+var lambda=0.1; //exponent for t-stat in ALDI
+
+//Nepal: 
+var startYrT1 = ee.Date('2012-04-01'); var endYrT1 = ee.Date('2015-04-11'); //Nepal EQ
+var startYrT2 = ee.Date('2015-05-12'); var endYrT2 = ee.Date('2016-05-12'); //Nepal EQ 25/4-12/5/2015 
+//var AOIpoint = ee.Geometry.Rectangle(84.9, 27.8, 85.9, 28.6); //Nepal EQ
+
+// Define global variables
+var n_months = 12;
+var startDOY = 1;
+var endDOY = 30;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////// Internal Functions ///////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+////////// Get NDVI from Landsat 8 imagery and add as a new band (nd) ////////////////////////
+var addNDVIl8 = function(image) {
+  return image.addBands(image.normalizedDifference(['B5', 'B4']));
+}; 
+
+///////// Get NDVI from Landsat 4,5 and 7 imagery and add as a new band (nd) /////////////////
+var addNDVIl457 = function(image) {
+  return image.addBands(image.normalizedDifference(['B4', 'B3']));
+}; 
+
+////////// Get NDSI from Landsat 8 imagery and add as a new band (ndsi) ////////////////////////
+var addNDSIl8 = function(image) {
+  var ndsi = image.expression(
+    '(GREEN - SWIR) / (GREEN + SWIR)',{'GREEN': image.select('B3'),'SWIR': image.select('B6'),});
+  return image.addBands(ndsi.rename('ndsi'));
+}; 
+
+///////// Get NDSI from Landsat 4,5 and 7 imagery and add as a new band (ndsi) /////////////////
+var addNDSIl457 = function(image) {
+  var ndsi = image.expression(
+    '(GREEN - SWIR) / (GREEN + SWIR)',{'GREEN': image.select('B2'),'SWIR': image.select('B5'),});
+  return image.addBands(ndsi.rename('ndsi'));
+}; 
+
+///////// Mask cloudy pixels ///////////////////////////////////////////////////////////////////
+var cloudMask = function(image) {
+  var clouds = ee.Algorithms.Landsat.simpleCloudScore(image).select(['cloud']);
+  return image.updateMask(clouds.lt(cloudthresh)); 
+}; 
+
+
+//////// Calculate NDVI (and NDSI) statistics for stacks grouped by month /////////////////////
+var NDVI_DOYstats = function(startDOY,endDOY,startYr,endYr,AOIpoint) {
+
+// Load the land mask from the SRTM DEM.
+var landMask = ee.Image('CGIAR/SRTM90_V4').mask(); 
+
+// Define Landsat collections. Filter by: year, day of year; sort by: cloudcover; add: NDVI, NDSI and cloudmask layers.
+  var l8_collT1 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA').filterBounds(AOIpoint)
+  .filterDate(startYr, endYr).filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
+  .sort('CLOUD_COVER').map(addNDVIl8).map(addNDSIl8).map(cloudMask);
+  var l7_collT1 = ee.ImageCollection('LANDSAT/LE07/C01/T1_TOA').filterBounds(AOIpoint)
+    .filterDate(startYr, endYr).filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
+    .map(addNDVIl457).map(addNDSIl457).map(cloudMask);
+  var l5_collT1 = ee.ImageCollection('LANDSAT/LT05/C01/T1_TOA').filterBounds(AOIpoint)
+    .filterDate(startYr, endYr).filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
+    .map(addNDVIl457).map(addNDSIl457).map(cloudMask);
+
+// Merge Landsat 5-8 data to create a single stack of NDVI and another of NDSI //
+var ndvi_collT1 = ee.ImageCollection(l5_collT1.select('nd').merge(l7_collT1.select('nd')).merge(l8_collT1.select('nd'))); //NDVI stack (merged from all sensors)
+var ndsi_collT1=ee.ImageCollection(l5_collT1.select('ndsi').merge(l7_collT1.select('ndsi')).merge(l8_collT1.select('ndsi'))); //NDSI stack (merged from all sensors)
+
+var NDVI_DOYstats_out = ndvi_collT1.median();               // Median NDVI from the merged stack
+var ndsi_medianT1 = ndsi_collT1.reduce(ee.Reducer.median());  // Median of NDSI from the merged stack.
+
+//Generate a multiband output image with each statistic as a band
+return NDVI_DOYstats_out.addBands(ndsi_medianT1).unmask(0).updateMask(landMask); // band names: nd=medianNDVI, ndsi_median=medianNDSI
+ 
+ 
+}; // end of internal function to calculate NDVI & NDSI stats
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////// Main Script //////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//// Initialise variables for use in loop by calculating first iteration outside loop
+var ndvi_statsT1=NDVI_DOYstats(startDOY,endDOY,startYrT1,endYrT1,AOIpoint); //run NDVI stats function pre-event stack January
+var ndvi_statsT2=NDVI_DOYstats(startDOY,endDOY,startYrT2,endYrT2,AOIpoint); //run NDVI stats function on post-event stack January
+var ndviDiffMed = ndvi_statsT2.select('nd').subtract(ndvi_statsT1.select('nd')); // difference of median Jan NDVIs (post-pre)
+var sum_ndviDiff = ndviDiffMed;                         //initialise rolling sum across months with Jan NDVI diff values
+var sum_ndviT2 = ndvi_statsT2.select('nd');             //initialise rolling sum across months with Jan post-event NDVI values
+var sum_ndsiT2 = ndvi_statsT2.select('ndsi_median');    //initialise rolling sum across months with Jan post-event NDSI values
+var ndviDiffMedStack = ndviDiffMed;                     //initialise stack of monthly NDVI diffs with Jan values
+
+//// Loop through months calculating NDVI difference and rolling sums
+for (var i = 1; i < n_months; ++i) {
+  var startDOY = 1+30*i; //first iteraton (i=1) is day 31, last iteration (i=11) is day 331
+  var endDOY = startDOY+30; //first iteration (i=1) is day 61, last iteration (i=11) is day 361
+  
+  // Generate stats for pre and post event stacks 
+  var ndvi_statsT1=NDVI_DOYstats(startDOY,endDOY,startYrT1,endYrT1,AOIpoint); //run NDVI stats function pre-event stack for current month (Feb-Dec)
+  var ndvi_statsT2=NDVI_DOYstats(startDOY,endDOY,startYrT2,endYrT2,AOIpoint); //run NDVI stats function on post-event stack for current month (Feb-Dec)
+  
+  // Difference median NDVI
+  var ndviDiffMed = ndvi_statsT2.select('nd').subtract(ndvi_statsT1.select('nd')); // difference median NDVIs (post-pre) for current month
+  var sum_ndviDiff = sum_ndviDiff.add(ndviDiffMed);     // sum (across iterations) post-event median NDVI (to calculate mean after loop)
+  var ndviDiffMedStack = ndviDiffMedStack.addBands(ndviDiffMed);  // generate stack of monthly median NDVI differences for t-test
+  
+  // Sum (across iterations) post-event NDVI & NDSI (to calculate mean after loop)
+  var sum_ndviT2 = sum_ndviT2.add(ndvi_statsT2.select('nd')); // sum post-event median NDVI
+  var sum_ndsiT2 = sum_ndsiT2.add(ndvi_statsT2.select('ndsi_median')); // sum post-event median NDSI
+  
+} // end of for loop through months of the year
+
+//// Calculate mean of monthly stats using sums from for loop
+var mean_ndviDiff=sum_ndviDiff.divide(n_months);  //mean NDVI difference
+var mean_ndviT2=sum_ndviT2.divide(n_months);      //mean post-event NDVI
+var mean_ndsiT2=sum_ndsiT2.divide(n_months);      //mean post-event NDSI
+
+//// Create a mask for cells falling below the NDSI threshold
+var NDSI_mask = mean_ndsiT2.lte(NDSIthresh); 
+
+//// t-test analysis
+var sum_d = ndviDiffMedStack.expression('(b(0)+b(1)+b(2)+b(3)+b(4)+b(5)+b(6)+b(7)+b(8)+b(9)+b(10)+b(11))'); //sum of differences
+
+var sum_dsq = ndviDiffMedStack.expression(
+  '(b(0)**2+b(1)**2+b(2)**2+b(3)**2+b(4)**2+b(5)**2+b(6)**2+b(7)**2+b(8)**2+b(9)**2+b(10)**2+b(11)**2)'); //sum of squared differences
+
+var t_stat = sum_d.expression(
+    'sum_d/(((n * sum_dsq - sum_d**2)/(n-1))**0.5)', {
+    'sum_d': sum_d,    'n': n_months,    'sum_dsq': sum_dsq  }); // perform t-test using sample size, sum of differences and squared differences
+    
+var t_0 = t_stat.lte(0);
+var t_stat = t_stat.multiply(t_0); //set positive t-stat values to zero they are not relevant and could cause problems when raised to a power
+    
+//// Evaluate ALDI equation
+var ALDI = mean_ndviDiff.expression(
+  '(-1*md)**alpha * (1 - mT)**beta * (-1*Tstat)**lambda * Smask',
+  {  'md': mean_ndviDiff,  'mT': mean_ndviT2,  'Smask': NDSI_mask, 'Tstat': t_stat, 'alpha': alpha, 'beta': beta, 'lambda': lambda});
+  
+
+//// Display  
+Map.addLayer(mean_ndviT2, {min: '0', max: '2', palette: 'FF0000,000000,00FF00'}, 'NDVImed_T2');
+Map.addLayer(ALDI, {min: '0', max: '0.3',palette: 'FFFFFF, 000000'}, 'ALDI');
+Map.addLayer(table.draw({color: '006600', strokeWidth: 4}),{},"obsLsdAOI"); //AOI outline
+
+//// Export 
+
+// Export post-event mean of median NDVIs as GeoTIFF
+Export.image.toDrive({ 
+  image: mean_ndviT2,
+  description: 'mean_ndvi',
+  scale: 30,
+  region: AOIpoint,
+  fileFormat: 'GeoTIFF',
+  formatOptions: {
+    cloudOptimized: true
+  }
+});
+
+// Export post-event mean of median NDVIs as GeoTIFF
+Export.image.toDrive({ 
+  image: mean_ndsiT2,  description: 'mean_ndsi',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  formatOptions: {    cloudOptimized: true  }
+});
+
+// Export mean of NDVI differences as GeoTIFF
+Export.image.toDrive({
+  image: mean_ndviDiff,  description: 'ndvi_diff',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  formatOptions: {    cloudOptimized: true  }
+});
+
+// Export t statistic as GeoTIFF
+Export.image.toDrive({
+  image: t_stat,  description: 't_statistic',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  formatOptions: {    cloudOptimized: true  }
+});
+
+// Export predictions based on NDVIdiff (commented for speed)
+Export.image.toDrive({
+  image: ALDI,  description: 'ALDI',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  formatOptions: {    cloudOptimized: true  }
+});
