@@ -1,83 +1,275 @@
-// Define parameters //////////////////////
-var AOIpoint = table; //MAKE SURE YOU IMPORT the AOI shapefile and label it table
-var cloudthresh=70; //default (and first runs) used 50
-var NDSIthresh=0.5;//define an NDSI threshold to mask snowy pixels, higher values allow inclusion of snowier pixels lower values are a stricter mask
-var t_thresh = -3.106; //define t-test threshold, for 11 deg freedom (n months - 1), crit vals: alpha,t; 0.1,1.796; 0.05,2.179; 0.01,3.106
-var alpha=1; //exponent for NDVIdifference term in ALDI
-var beta=1; //exponent for post-event median NDVI in ALDI
-var lambda=0.1; //exponent for t-stat in ALDI
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////// ALDI v1.1 Automated Landslide Detection Algorithm //////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// See: "Milledge, D.G., Bellugi, D.G., Watt, J. and Densmore, A.L., 2021. Automated landslide detection outperforms...
+// manual mapping for several recent large earthquakes. Natural Hazards and Earth System Sciences Discussions, pp.1-39."
+// https://nhess.copernicus.org/preprints/nhess-2021-168/
 
-//Nepal: 
-var startYrT1 = ee.Date('2012-04-01'); var endYrT1 = ee.Date('2015-04-11'); //Nepal EQ
-var startYrT2 = ee.Date('2015-05-12'); var endYrT2 = ee.Date('2016-05-12'); //Nepal EQ 25/4-12/5/2015 
-//var AOIpoint = ee.Geometry.Rectangle(84.9, 27.8, 85.9, 28.6); //Nepal EQ
 
-// Define global variables
-var n_months = 12;
-var startDOY = 1;
-var endDOY = 30;
+/////////////////////////////////////////////////////////
+//////////////// User Inputs ////////////////////////////
+/////////////////////////////////////////////////////////
+
+//////// Area of Interest (user input required): coordinates of AOI bounding box 
+
+//// Choose your coordinate format: Latitude,Longitude = true; Longitude,Latitude = false 
+var LatLon = false; // Coordinates pasted from Google maps are Lat,Lon so set to true; those from Google Earth Engine's Inspector tab at Lon,Lat so set to false
+
+//// Choose coordinates for your study area
+var LowerLeftLL = [84.4, 27.6];   //Longitude and Latitude of lower left corner (i.e. min x and y)
+var UpperRightLL = [86.2, 28.6];  //Longitude and Latitude of upper right corner (i.e. max x and y)
+//Examples (in Lon,Lat format) Lower left then Upper Right:
+// Kashmir2005:               [73.4, 34.0];   [74.0, 34.7];
+// Aisen2007:                 [-73.2, -45.6]; [-72.4, -45.2];
+// Haiti2010:                 [-72.9, 18.1];  [-72.0, 18.5];
+// Wenchuan2008:              [102.4, 30.4];  [105.0, 32.6];
+// Gorkha2015:                [84.4, 27.6];   [86.2, 28.6];
+
+//////// Trigger event timing (user input required) ////////
+var trigT1 = ee.Date('2015-04-11'); // set the start date for the trigger event
+var trigT2 = ee.Date('2015-05-12'); // set the end date for the trigger event
+// Note: trigger start and end dates may be the same but not always e.g. Nepal EQ start:25/4/2015, end:12/5/2015 because there were large aftershocks.
+//Examples:
+// Kashmir2005:  ('2005-10-07');  ('2005-10-08');
+// Aisen2007:    ('2007-01-21');  ('2007-04-23');
+// Haiti2010:    ('2010-01-12');  ('2010-01-13');
+// Wenchuan2008: ('2008-05-11');  ('2008-05-12');
+// Gorkha2015:   ('2015-04-11');  ('2015-05-12');
+
+//////// Set AOI using defined coordinates (no user input required here)
+if (LatLon) {  LowerLeftLL.reverse();  }
+var AOI = ee.Geometry.Rectangle(LowerLeftLL[0], LowerLeftLL[1], UpperRightLL[0], UpperRightLL[1]);
+
+Map.centerObject(AOI, 9); // Navigate to your defined AOI - comment this line IF you want to examine a smaller sub-region
+
+/////////////////////////////////////////////////////////////////////////
+/////// Define Parameters (no user input required) //////////////////////
+/////////////////////////////////////////////////////////////////////////
+
+//// Global Parameter set (from Milledge et al. 2021) 
+
+// pre- and post- event window sizes (Milledge et al (2021) found that 5 yrs pre, 2 yrs post and a cloudthreshold of 50 performed well across multiple sites
+var startYrT1=trigT1.advance(-5, 'years'); // sets the start date for the pre-event window (exactly 5 years prior to trigger date)
+var endYrT2=trigT2.advance(2, 'years'); // sets the end date for the post-event window (exactly 2 years after trigger date)
+var cloudthresh=50; //Landsat simple cloudscore censoring threshold. 
+
+//NDSI threshold to mask snowy pixels, higher allow snowier pixels (array of 100 parameters from global set in Milledge et al. 2021)
+var NDSIthresh=ee.Array([0.24,0.25,0.28,0.29,0.29,0.37,0.31,0.19,0.78,0.37,0.12,0.13,0.10,0.15,0.11,0.11,0.09,0.19,0.15,0.26,0.90,0.78,0.84,0.82,0.92,0.64,0.79,0.59,0.60,0.75,0.92,0.60,0.85,0.90,0.97,0.78,0.84,0.53,0.57,0.92,0.48,0.82,0.37,0.36,0.35,0.83,0.51,0.60,0.73,0.99,0.32,0.34,0.23,0.68,0.36,0.76,0.24,0.45,0.92,0.44,0.71,0.16,0.59,0.70,0.16,0.51,0.84,0.44,0.84,0.27,0.71,0.16,0.16,0.59,0.51,0.70,0.27,0.44,0.11,0.50,0.94,0.24,0.62,0.20,0.69,0.68,0.18,0.67,0.71,0.67,0.94,0.68,0.24,0.69,0.67,0.62,0.31,0.20,0.61,0.88]);
+
+//exponent for NDVIdifference term in ALDI
+var alpha=    [1.58,5.12,5.97,6.93,4.41,0.42,8.38,7.68,4.94,4.45,5.04,2.89,9.57,5.88,8.12,0.97,7.72,7.68,3.86,2.87,9.17,5.93,6.07,6.36,9.23,0.01,5.44,3.23,0.46,8.79,9.23,0.46,6.52,9.17,5.39,5.93,6.07,4.65,9.44,1.73,1.48,4.35,1.19,6.05,1.50,5.57,9.73,7.17,1.46,7.89,3.95,5.82,0.65,1.47,6.05,2.30,9.10,6.86,1.26,8.03,0.50,7.16,2.12,9.75,5.07,5.18,9.70,6.91,3.62,6.37,0.50,5.07,7.16,2.12,5.18,9.75,6.37,6.91,9.77,2.15,7.78,1.59,5.60,4.07,4.84,7.07,2.00,9.32,9.39,6.41,7.78,7.07,1.59,4.84,9.32,5.60,2.59,4.07,5.54,7.98];
+
+//exponent ratio alpha:beta in ALDI equation controls relationship between dV&Vpost
+var abRatio=  [77.23,35.45,66.09,88.90,33.12,66.48,58.71,38.84,39.59,22.26,67.94,13.82,30.81,24.94,15.51,46.67,29.55,38.84,8.75,31.64,2.50,2.42,2.47,1.94,2.62,2.21,4.55,3.15,2.34,1.48,2.62,2.34,2.20,2.50,3.98,2.42,2.47,3.15,4.82,1.59,3.07,2.99,4.08,2.71,4.39,3.93,3.03,2.95,2.54,4.60,2.38,1.49,2.44,1.68,2.71,1.47,1.23,2.03,1.99,1.64,76.51,33.43,90.03,38.26,85.32,73.51,11.00,37.10,8.30,28.02,76.51,85.32,33.43,90.03,73.51,38.26,28.02,37.10,41.00,21.40,81.97,0.03,0.09,0.02,15.50,1.39,16.35,7.18,3.46,48.11,81.97,1.39,0.03,15.50,7.18,0.09,0.02,0.02,2.85,1.09]; 
+
+//exponent ratio beta:lambda in ALDI equation controls relationship between dV&Pt
+var alRatio=  [0.029,0.051,0.021,0.049,0.017,0.032,0.051,0.048,0.026,0.033,0.045,0.022,0.067,0.013,0.015,0.103,0.021,0.048,0.017,0.011,0.054,0.046,0.042,0.033,0.099,0.027,0.032,0.026,0.108,0.024,0.099,0.108,0.182,0.054,0.173,0.046,0.042,0.293,0.143,0.056,0.161,0.168,0.201,0.217,0.236,0.319,0.343,0.357,0.067,0.168,0.373,0.104,1.163,0.244,0.217,0.138,0.146,0.107,0.540,0.413,0.010,0.010,0.012,0.012,0.011,0.013,0.012,0.013,0.011,0.012,0.010,0.011,0.010,0.012,0.013,0.012,0.012,0.013,0.014,0.014,3.460,1.159,0.015,0.072,0.016,15.861,0.170,0.033,0.337,0.027,3.460,15.861,1.159,0.016,0.033,0.015,0.011,0.072,72.011,1.188]; 
+
+//// Define global variables
+var n_months = 12; // number of months in a year
+
+//// Define derived variables
+// Parameters: alpha, beta, lambda for ALDI equation
+var nRuns = alpha.length; //number of runs set by number of parameter sets
+var alpha=ee.Array(alpha);
+var beta=ee.Array(alpha.divide(ee.Array(abRatio)));
+var lambda=ee.Array(alpha.divide(ee.Array(alRatio)));
 
 /////////////////////////////////////////////////////////////////////////////////////////////
 ////////////////////// Internal Functions ///////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////
 
+////// t-test functions   ///////////////////////////////////////////////////////////////////
+// Functions for Gaussian and Student's t distributions not currently built in to GEE. We implement them follwing ACM algorithms: #209 & #395
+// SEE: https://gist.github.com/bellbind/801c5de20aa4f310062363f3f95a099e and https://msdn.microsoft.com/ja-jp/magazine/mt620016.asp
+
+function fGauss(z) {
+// ACM Algorithm #209
+// integral amount of Normal Distribution (for mean=0, SD=1) returns a value between 0 and 1
+// - gauss(z) = (1 + erf(z * 2**-0.5))/2
+// input = z-value (-inf to +inf)
+// output = p under Standard Normal curve from -inf to z e.g., if z = 0.0, function returns 0.5000
+
+  var y=z.abs().divide(2);            //209 scratch variable
+  var w=y.multiply(y);              // 209 scratch variable
+  var y2= y.subtract(2.0);          // additional variable to avoid redefining y within the conditional expression
+  var c=ee.Array([
+    +0.000124818987,
+    -0.001075204047,
+    +0.005198775019,
+    -0.019198292004,
+    +0.059054035642,
+    -0.151968751364,
+    +0.319152932694,
+    -0.531923007300,
+    +0.797884560593]);
+    
+   var c2=ee.Array([
+    -0.000045255659,
+    +0.000152529290,
+    -0.000019538132,
+    -0.000676904986,
+    +0.001390604284,
+    -0.000794620820,
+    -0.002034254874,
+    +0.006549791214,
+    -0.010557625006,
+    +0.011630447319,
+    -0.009279453341,
+    +0.005353579108,
+    -0.002141268741,
+    +0.000535310849,
+    +0.999936657524]);
+
+  var p1=(w.multiply(w.multiply(w.multiply(w.multiply(w.multiply(w.multiply(w.multiply(w.multiply(c.get([0]))
+  .add(c.get([1])))
+  .add(c.get([2])))
+  .add(c.get([3])))
+  .add(c.get([4])))
+  .add(c.get([5])))
+  .add(c.get([6])))
+  .add(c.get([7])))
+  .add(c.get([8])))
+  .multiply(y).multiply(2.0); //  if y < 1... eqn from 209. 
+  
+  
+  var p2=y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2.multiply(y2
+  .multiply(c2.get([0]))
+  .add(c2.get([1])))
+  .add(c2.get([2])))
+  .add(c2.get([3])))
+  .add(c2.get([4])))
+  .add(c2.get([5])))
+  .add(c2.get([6])))
+  .add(c2.get([7])))
+  .add(c2.get([8])))
+  .add(c2.get([9])))
+  .add(c2.get([10])))
+  .add(c2.get([11])))
+  .add(c2.get([12])))
+  .add(c2.get([13])))
+  .add(c2.get([14]));
+
+  var p=z.expression('z==0 ? 0.0 : y >= 3 ? 1 : y < 1 ? p1 : p2',  {'z':z, 'y':y, 'p1':p1, 'p2':p2} );
+  
+  var out=p.expression('z==0 ? 0.5: z > 0 ? (1 + p) / 2 : (1 - p) / 2',  
+    {'z':z, 'p':p} );
+  return out;
+
+}
+
+function fStudent(t, df) {
+// ACM Algorithm #395 (student t-distribution: df as double)
+// t-dist : distribution for average of (df+1)-samples from ND(mean=0, SD=1)
+// student(t, df) returns
+//   integral probability of both side area (< -t) and (t <) of t-dist(df)
+var tsq = t.multiply(t);
+var y = tsq.divide(df);
+var b = y.add(1.0);
+var lnb = b.log();
+var myY0=y.expression('y > 0.000001 ? lnb : y', {'y':y, 'lnb':lnb} );
+
+var a = df.subtract(0.5);
+var bn = a.multiply(a).multiply(48);
+
+var yn = myY0.multiply(a);
+var sqrtYn = yn.sqrt();
+var y2 = yn.expression(
+  '(((((-0.4 * yn - 3.3) * yn - 24.0) * yn - 85.5) /  (0.8 * yn * yn + 100.0 + bn) + yn + 3.0) / bn + 1.0) * sqrtY',
+  {'yn':yn, 'bn':bn, 'sqrtY':sqrtYn}
+  );
+var gin = y2.multiply(-1);
+var gout = fGauss(gin);
+var out=gout.multiply(2);
+
+return out;
+}
+
+
+////// Landsat stack functions  ///////////////////////////////////////////////////////////////
+
 ////////// Get NDVI from Landsat 8 imagery and add as a new band (nd) ////////////////////////
-var addNDVIl8 = function(image) {
+var fAddNDVIl8 = function(image) {
   return image.addBands(image.normalizedDifference(['B5', 'B4']));
 }; 
 
 ///////// Get NDVI from Landsat 4,5 and 7 imagery and add as a new band (nd) /////////////////
-var addNDVIl457 = function(image) {
+var fAddNDVIl457 = function(image) {
   return image.addBands(image.normalizedDifference(['B4', 'B3']));
 }; 
 
 ////////// Get NDSI from Landsat 8 imagery and add as a new band (ndsi) ////////////////////////
-var addNDSIl8 = function(image) {
+var fAddNDSIl8 = function(image) {
   var ndsi = image.expression(
     '(GREEN - SWIR) / (GREEN + SWIR)',{'GREEN': image.select('B3'),'SWIR': image.select('B6'),});
   return image.addBands(ndsi.rename('ndsi'));
 }; 
 
 ///////// Get NDSI from Landsat 4,5 and 7 imagery and add as a new band (ndsi) /////////////////
-var addNDSIl457 = function(image) {
+var fAddNDSIl457 = function(image) {
   var ndsi = image.expression(
     '(GREEN - SWIR) / (GREEN + SWIR)',{'GREEN': image.select('B2'),'SWIR': image.select('B5'),});
   return image.addBands(ndsi.rename('ndsi'));
 }; 
 
 ///////// Mask cloudy pixels ///////////////////////////////////////////////////////////////////
-var cloudMask = function(image) {
+var fCloudMask = function(image) {
   var clouds = ee.Algorithms.Landsat.simpleCloudScore(image).select(['cloud']);
   return image.updateMask(clouds.lt(cloudthresh)); 
 }; 
 
 
+///////// HSV-based Pan-Sharpening of Landsat 8 images //////////////////////
+var fPanSharpenL8 = function(image) {
+  //var rgb = image.select('B4', 'B3', 'B2');                 //get red green and blue bands
+  var rgb = image.select('B5', 'B4', 'B3');                 //get near infra-red red and green bands
+  var pan = image.select('B8');                             //get panchromatic band
+  var huesat = rgb.rgbToHsv().select('hue', 'saturation');  //convert RGB to HSV and select only hue and saturation
+  var upres = ee.Image.cat(huesat, pan).hsvToRgb();         //swap in the pan band, then convert back to RGB.
+  return image.addBands(upres);
+};
+
+///////// HSV-based Pan-Sharpening of Landsat 7 images //////////////////////
+var fPanSharpenL7 = function(image) {
+  //var rgb = image.select('B3', 'B2', 'B1');                 //get red green and blue bands
+  var rgb = image.select('B4', 'B3', 'B2');                 //get near infra-red red and green bands
+  var pan = image.select('B8');                             //get panchromatic band
+  var huesat = rgb.rgbToHsv().select('hue', 'saturation');  //convert RGB to HSV and select only hue and saturation
+  var upres = ee.Image.cat(huesat, pan).hsvToRgb();         //swap in the pan band, then convert back to RGB.
+  return image.addBands(upres);
+};
+
+
+
+
 //////// Calculate NDVI (and NDSI) statistics for stacks grouped by month /////////////////////
-var NDVI_DOYstats = function(startDOY,endDOY,startYr,endYr,AOIpoint) {
+var fSTACKstats = function(startDOY,endDOY,startYr,endYr,AOI) {
 
 // Load the land mask from the SRTM DEM.
 var landMask = ee.Image('CGIAR/SRTM90_V4').mask(); 
 
 // Define Landsat collections. Filter by: year, day of year; sort by: cloudcover; add: NDVI, NDSI and cloudmask layers.
-  var l8_collT1 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA').filterBounds(AOIpoint)
+  var l8_coll = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA').filterBounds(AOI)
   .filterDate(startYr, endYr).filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
-  .sort('CLOUD_COVER').map(addNDVIl8).map(addNDSIl8).map(cloudMask);
-  var l7_collT1 = ee.ImageCollection('LANDSAT/LE07/C01/T1_TOA').filterBounds(AOIpoint)
+  .sort('CLOUD_COVER').map(fAddNDVIl8).map(fAddNDSIl8).map(fCloudMask);
+  
+  var l7_coll = ee.ImageCollection('LANDSAT/LE07/C01/T1_TOA').filterBounds(AOI)
     .filterDate(startYr, endYr).filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
-    .map(addNDVIl457).map(addNDSIl457).map(cloudMask);
-  var l5_collT1 = ee.ImageCollection('LANDSAT/LT05/C01/T1_TOA').filterBounds(AOIpoint)
+    .map(fAddNDVIl457).map(fAddNDSIl457).map(fCloudMask);
+  
+  var l5_coll = ee.ImageCollection('LANDSAT/LT05/C01/T1_TOA').filterBounds(AOI)
     .filterDate(startYr, endYr).filter(ee.Filter.calendarRange(startDOY, endDOY, 'day_of_year'))
-    .map(addNDVIl457).map(addNDSIl457).map(cloudMask);
+    .map(fAddNDVIl457).map(fAddNDSIl457).map(fCloudMask);
 
 // Merge Landsat 5-8 data to create a single stack of NDVI and another of NDSI //
-var ndvi_collT1 = ee.ImageCollection(l5_collT1.select('nd').merge(l7_collT1.select('nd')).merge(l8_collT1.select('nd'))); //NDVI stack (merged from all sensors)
-var ndsi_collT1=ee.ImageCollection(l5_collT1.select('ndsi').merge(l7_collT1.select('ndsi')).merge(l8_collT1.select('ndsi'))); //NDSI stack (merged from all sensors)
+var ndvi_coll = ee.ImageCollection(l5_coll.select('nd').merge(l7_coll.select('nd')).merge(l8_coll.select('nd'))); //NDVI stack (merged from all sensors)
+var ndsi_coll = ee.ImageCollection(l5_coll.select('ndsi').merge(l7_coll.select('ndsi')).merge(l8_coll.select('ndsi'))); //NDSI stack (merged from all sensors)
 
-var NDVI_DOYstats_out = ndvi_collT1.median();               // Median NDVI from the merged stack
-var ndsi_medianT1 = ndsi_collT1.reduce(ee.Reducer.median());  // Median of NDSI from the merged stack.
+var out = ndvi_coll.median();               // Median NDVI from the merged stack
+var ndsi_median = ndsi_coll.reduce(ee.Reducer.median());  // Median of NDSI from the merged stack.
 
 //Generate a multiband output image with each statistic as a band
-return NDVI_DOYstats_out.addBands(ndsi_medianT1).unmask(0).updateMask(landMask); // band names: nd=medianNDVI, ndsi_median=medianNDSI
+return out.addBands(ndsi_median).unmask(0).updateMask(landMask); // band names: nd=medianNDVI, ndsi_median=medianNDSI
  
  
 }; // end of internal function to calculate NDVI & NDSI stats
@@ -87,102 +279,234 @@ return NDVI_DOYstats_out.addBands(ndsi_medianT1).unmask(0).updateMask(landMask);
 ////////////////////// Main Script //////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////////////////////
 
-
 //// Initialise variables for use in loop by calculating first iteration outside loop
-var ndvi_statsT1=NDVI_DOYstats(startDOY,endDOY,startYrT1,endYrT1,AOIpoint); //run NDVI stats function pre-event stack January
-var ndvi_statsT2=NDVI_DOYstats(startDOY,endDOY,startYrT2,endYrT2,AOIpoint); //run NDVI stats function on post-event stack January
-var ndviDiffMed = ndvi_statsT2.select('nd').subtract(ndvi_statsT1.select('nd')); // difference of median Jan NDVIs (post-pre)
-var sum_ndviDiff = ndviDiffMed;                         //initialise rolling sum across months with Jan NDVI diff values
-var sum_ndviT2 = ndvi_statsT2.select('nd');             //initialise rolling sum across months with Jan post-event NDVI values
-var sum_ndsiT2 = ndvi_statsT2.select('ndsi_median');    //initialise rolling sum across months with Jan post-event NDSI values
-var ndviDiffMedStack = ndviDiffMed;                     //initialise stack of monthly NDVI diffs with Jan values
+var STACKstatsT1=fSTACKstats(1,30,startYrT1,trigT1,AOI); //run fSTACKstats function pre-event stack January (startDOY=1; endDOY=30)
+var STACKstatsT2=fSTACKstats(1,30,trigT2,endYrT2,AOI);   //run fSTACKstats function on post-event stack January (startDOY=1; endDOY=30)
+var dNDVI = STACKstatsT2.select('nd').subtract(STACKstatsT1.select('nd')); // difference of median Jan NDVIs (post-pre)
+var dNDVIsum = dNDVI;                                  //initialise rolling sum across months with Jan NDVI diff values
+var ndviT2sum = STACKstatsT2.select('nd');             //initialise rolling sum with Jan post-event NDVI values
+var ndsiT2sum = STACKstatsT2.select('ndsi_median');    //initialise rolling sum with Jan post-event NDSI values
+var dNDVIstack = dNDVI;                                //initialise stack of monthly NDVI diffs with Jan values
 
 //// Loop through months calculating NDVI difference and rolling sums
 for (var i = 1; i < n_months; ++i) {
-  var startDOY = 1+30*i; //first iteraton (i=1) is day 31, last iteration (i=11) is day 331
-  var endDOY = startDOY+30; //first iteration (i=1) is day 61, last iteration (i=11) is day 361
+  
+  var startDOY = 1+Math.round(30.4*i);  //first iteraton (i=1) is day 31, last iteration (i=11) is day 335
+  var endDOY = startDOY+30;             //first iteration (i=1) is day 61, last iteration (i=11) is day 365
   
   // Generate stats for pre and post event stacks 
-  var ndvi_statsT1=NDVI_DOYstats(startDOY,endDOY,startYrT1,endYrT1,AOIpoint); //run NDVI stats function pre-event stack for current month (Feb-Dec)
-  var ndvi_statsT2=NDVI_DOYstats(startDOY,endDOY,startYrT2,endYrT2,AOIpoint); //run NDVI stats function on post-event stack for current month (Feb-Dec)
+  var STACKstatsT1=fSTACKstats(startDOY,endDOY,startYrT1,trigT1,AOI);  //run fSTACKstats function pre-event stack for current month (Feb-Dec)
+  var STACKstatsT2=fSTACKstats(startDOY,endDOY,trigT2,endYrT2,AOI);    //run fSTACKstats function on post-event stack for current month (Feb-Dec)
   
   // Difference median NDVI
-  var ndviDiffMed = ndvi_statsT2.select('nd').subtract(ndvi_statsT1.select('nd')); // difference median NDVIs (post-pre) for current month
-  var sum_ndviDiff = sum_ndviDiff.add(ndviDiffMed);     // sum (across iterations) post-event median NDVI (to calculate mean after loop)
-  var ndviDiffMedStack = ndviDiffMedStack.addBands(ndviDiffMed);  // generate stack of monthly median NDVI differences for t-test
+  var dNDVI = STACKstatsT2.select('nd').subtract(STACKstatsT1.select('nd'));  // difference median NDVIs (post-pre) for current month
+  var dNDVIsum = dNDVIsum.add(dNDVI);                                         // sum (across iterations) post-event median NDVI (to calculate mean after loop)
+  var dNDVIstack = dNDVIstack.addBands(dNDVI);                                // generate stack of monthly median NDVI differences for t-test
   
-  // Sum (across iterations) post-event NDVI & NDSI (to calculate mean after loop)
-  var sum_ndviT2 = sum_ndviT2.add(ndvi_statsT2.select('nd')); // sum post-event median NDVI
-  var sum_ndsiT2 = sum_ndsiT2.add(ndvi_statsT2.select('ndsi_median')); // sum post-event median NDSI
+  // Sum (across iterations) post-event NDVI & NDSI (to calc mean after loop)
+  var ndviT2sum = ndviT2sum.add(STACKstatsT2.select('nd'));          // sum post-event median NDVI
+  var ndsiT2sum = ndsiT2sum.add(STACKstatsT2.select('ndsi_median')); // sum post-event median NDSI
   
 } // end of for loop through months of the year
 
-//// Calculate mean of monthly stats using sums from for loop
-var mean_ndviDiff=sum_ndviDiff.divide(n_months);  //mean NDVI difference
-var mean_ndviT2=sum_ndviT2.divide(n_months);      //mean post-event NDVI
-var mean_ndsiT2=sum_ndsiT2.divide(n_months);      //mean post-event NDSI
+//// Calculate mean of monthly stats using sums from the for loop
+var dV=dNDVIsum.divide(n_months);           //mean NDVI difference (dV)
+var Vpost=ndviT2sum.divide(n_months);       //mean post-event NDVI (Vpost)
+var Spost=ndsiT2sum.divide(n_months);       //mean post-event NDSI (Spost)
 
-//// Create a mask for cells falling below the NDSI threshold
-var NDSI_mask = mean_ndsiT2.lte(NDSIthresh); 
+//// Calculate the Student's t statistic
+var sum_d = dNDVIstack.expression('(b(0)+b(1)+b(2)+b(3)+b(4)+b(5)+b(6)+b(7)+b(8)+b(9)+b(10)+b(11))'); //sum of differences
 
-//// t-test analysis
-var sum_d = ndviDiffMedStack.expression('(b(0)+b(1)+b(2)+b(3)+b(4)+b(5)+b(6)+b(7)+b(8)+b(9)+b(10)+b(11))'); //sum of differences
-
-var sum_dsq = ndviDiffMedStack.expression(
+var sum_dsq = dNDVIstack.expression(
   '(b(0)**2+b(1)**2+b(2)**2+b(3)**2+b(4)**2+b(5)**2+b(6)**2+b(7)**2+b(8)**2+b(9)**2+b(10)**2+b(11)**2)'); //sum of squared differences
 
 var t_stat = sum_d.expression(
     'sum_d/(((n * sum_dsq - sum_d**2)/(n-1))**0.5)', {
     'sum_d': sum_d,    'n': n_months,    'sum_dsq': sum_dsq  }); // perform t-test using sample size, sum of differences and squared differences
-    
-var t_0 = t_stat.lte(0);
-var t_stat = t_stat.multiply(t_0); //set positive t-stat values to zero they are not relevant and could cause problems when raised to a power
-    
-//// Evaluate ALDI equation
-var ALDI = mean_ndviDiff.expression(
-  '(-1*md)**alpha * (1 - mT)**beta * (-1*Tstat)**lambda * Smask',
-  {  'md': mean_ndviDiff,  'mT': mean_ndviT2,  'Smask': NDSI_mask, 'Tstat': t_stat, 'alpha': alpha, 'beta': beta, 'lambda': lambda});
+
+
+//// Calculate Pt for each pixel from the t statistic (using t-distribution) 
+var df=ee.Number(n_months-1);             // calculate degrees of freedom df=11 for monthly bins
+var Pt=fStudent(t_stat, df);              // find Pt from the Student's t distribution function given the t statistic
+var Pt=Pt.pow(0).subtract(Pt.divide(2));  // adjust for a single tail of the distribution and invert the probability, i.e: 1-pt/2
+var Pt=Pt.multiply(t_stat.lte(0));        // set positive t-stat values to zero they are not needed and cause problems when raised to a power
+
+//// Evaluate ALDI equation 
+dV = dV.multiply(dV.lte(0));                // Set positive NDVI differences (i.e. increases) to zero
+var Smask = Spost.lte(NDSIthresh.get([0])); // Create a mask for cells falling below the NDSI threshold
+
+// Initialise ALDI sum loop by calculating first iteration outside loop
+var ALDIsum = dV.expression(
+    '(-1*dV)**alpha * (1 - Vpost)**beta * (Pt)**lambda * Smask',
+    {  'dV': dV,  'Vpost': Vpost,  'Smask': Smask,
+    'Pt': Pt, 'alpha': alpha.get([0]), 'beta': beta.get([0]), 'lambda': lambda.get([0])});
+
+// Loop through nRuns (i.e. number of parameter sets) evaluating ALDI equation and calculating a rolling sum
+for (var i = 1; i < nRuns; ++i) {
   
+    Smask = Spost.lte(NDSIthresh.get([i])); //generate new snow mask using snow threshold parameter from set
+  
+    var ALDI = dV.expression(
+    '(-1*dV)**alpha * (1 - Vpost)**beta * (Pt)**lambda * Smask',
+    {  'dV': dV,  'Vpost': Vpost,  'Smask': Smask,  'Pt': Pt, 
+    'alpha': alpha.get([i]), 'beta': beta.get([i]), 'lambda': lambda.get([i])});
+  
+    var ALDIsum = ALDIsum.add(ALDI); //Rolling sum of ALDI values for each pixel
+}
+ALDI=ALDIsum.divide(nRuns); // calculate mean ALDI from rolling sum
 
-//// Display  
-Map.addLayer(mean_ndviT2, {min: '0', max: '2', palette: 'FF0000,000000,00FF00'}, 'NDVImed_T2');
-Map.addLayer(ALDI, {min: '0', max: '0.3',palette: 'FFFFFF, 000000'}, 'ALDI');
-Map.addLayer(table.draw({color: '006600', strokeWidth: 4}),{},"obsLsdAOI"); //AOI outline
 
-//// Export 
+/////////////////////////////////////////////////////////////////////////////////////////////
+/////// Generate cloud-free pansharpened pre and post images to check ALDI   //////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//// Pansharpen 2 years of Landsat TOA data before and after the trigger and take the median.
+
+var pre_img8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA').filterBounds(AOI)
+  .filterDate(trigT1.advance(-2, 'years'), trigT1)
+  .map(fPanSharpenL8).map(fCloudMask).median();
+
+var post_img8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA').filterBounds(AOI)
+  .filterDate(trigT2, trigT2.advance(2, 'years'))
+  .map(fAddNDVIl8).map(fPanSharpenL8).map(fCloudMask).median();
+
+
+var pre_img7 = ee.ImageCollection('LANDSAT/LE07/C01/T1_TOA').filterBounds(AOI)
+  .filterDate(trigT1.advance(-2, 'years'), trigT1)
+  .map(fPanSharpenL7).map(fCloudMask).median();
+
+var post_img7 = ee.ImageCollection('LANDSAT/LE07/C01/T1_TOA').filterBounds(AOI)
+  .filterDate(trigT2, trigT2.advance(2, 'years'))
+  .map(fPanSharpenL7).map(fCloudMask).median();
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+/////// Display ALDI and component layers  //////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//////////////////////////////////////////////////////////////////
+/////// Display: sub-functions ///////////////////////////////////
+//////////////////////////////////////////////////////////////////
+
+//// Function creates a color bar thumbnail image for use in legend from the given color palette.
+function fMakeColorBarParams(palette) {
+  return {bbox: [0, 0, 1, 0.1], dimensions: '50x5', format: 'png', min: 0, max: 1, palette: palette,  };
+}
+
+//// Function creates the legend
+function fMakeLegend(vis,title) {
+// Create the color bar for the legend.
+var colorBar = ui.Thumbnail({image:ee.Image.pixelLonLat().select(0), params:fMakeColorBarParams(vis.palette), style:{stretch: 'horizontal', margin:'0px 4px', maxHeight:'12px'}, });
+
+// Generate midpoint value for legend
+var midVal = ( (50*vis.max - 50*vis.min) + 100*vis.min) / 100;
+
+// Create a panel with three values for the legend.
+var legendLabels = ui.Panel({
+  widgets: [
+    ui.Label(vis.min, {margin: '2px 4px', fontSize: '10px'}),
+    ui.Label(midVal, {margin: '2px 4px', textAlign: 'center', stretch: 'horizontal', fontSize: '10px'}),
+    ui.Label(vis.max, {margin: '2px 4px', fontSize: '10px'})  ],
+  layout: ui.Panel.Layout.flow('horizontal') });
+
+var legendTitle = ui.Label({value: title,  style: {fontSize: '12px', fontWeight: 'bold'} });
+var myLegendPanel = ui.Panel([legendTitle, colorBar, legendLabels]);
+return  myLegendPanel;
+}
+
+
+
+//////////////////////////////////////////////////////////////////
+/////// Display: main script /////////////////////////////////////
+//////////////////////////////////////////////////////////////////
+
+
+//// Display composites to sanity check ALDI
+var vizParams = { bands: ['red', 'green', 'blue'],  min: 0,  max: 0.5, gamma: [0.95, 1.1, 1]}; // Define the visualization parameters.
+var flag = trigT1.difference(ee.Date('2015-02-11'), 'days')
+if (flag.getInfo()>0) {  
+  Map.addLayer(pre_img8, vizParams, 'pre-event L8'); 
+  Map.addLayer(post_img8, vizParams, 'post-event L8');
+}
+else {  
+  Map.addLayer(pre_img7, vizParams, 'pre-event L7'); 
+  Map.addLayer(post_img7, vizParams, 'post-event L7');
+}
+
+//Map.addLayer(pre_img, vizParams, 'pre-event'); 
+
+// Additional component layers used in calculating ALDI surface (commented to simplify visualisation)
+/*var Spostvis={min: '0', max: '1',palette: 'FFFFFF,00FFFF'};
+Map.addLayer(Spost, Spostvis, 'NDSIpost');         // Post event NDSI (snow index, Spost)
+
+var Vpostvis={min: '0', max: '1', palette: 'FF0000,FFFFFF,00FF00'};
+Map.addLayer(Vpost, Vpostvis, 'NDVIpost');         // Post event NDVI (vegetation index, Vpost)
+
+var dVvis={min: '-0.4', max: '0',palette: '000000, FFFFFF'};
+Map.addLayer(dV, dVvis, 'dV');                      // difference in NDVI before and after trigger (dV)
+
+var Ptvis={min: '0.9', max: '1',palette: 'FFFFFF, 00FF00,0000FF'};
+Map.addLayer(Pt, Ptvis, 'Pt');                      // likelihood that changes are significant relative to noise in NDVI (Pt)
+*/
+
+var ALDIvis={min: '0', max: '0.1',palette: 'FFFFFF,FFFF00,FF0000,00FF00,0000FF,000000'};
+Map.addLayer(ALDI, ALDIvis, 'ALDI');          //ALDI classification surface
+
+
+Map.add(fMakeLegend(ALDIvis,'ALDI'));   // Add the legendPanel to the map.
+
+//// Legends for commented additional layers
+//Map.add(fMakeLegend(Ptvis,'Pt')); // Add the legendPanel to the map.
+//Map.add(fMakeLegend(dVvis,'dV')); // Add the legendPanel to the map.
+//Map.add(fMakeLegend(Vpostvis,'Vpost')); // Add the legendPanel to the map.
+//Map.add(fMakeLegend(Spostvis,'Spost')); // Add the legendPanel to the map.
+
+// Display the AOI as a hollow outline
+var empty = ee.Image().byte();
+var outline = empty.paint({featureCollection: AOI, color: 1, width: 3});
+Map.addLayer(outline, {palette: '000000'}, 'AOI');
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+/////// Export Layers as GeoTIFFs  //////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////
 
 // Export post-event mean of median NDVIs as GeoTIFF
 Export.image.toDrive({ 
-  image: mean_ndviT2,
-  description: 'mean_ndvi',
-  scale: 30,
-  region: AOIpoint,
-  fileFormat: 'GeoTIFF',
-  formatOptions: {
-    cloudOptimized: true
-  }
-});
-
-// Export post-event mean of median NDVIs as GeoTIFF
-Export.image.toDrive({ 
-  image: mean_ndsiT2,  description: 'mean_ndsi',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  image: Vpost,  description: 'mean_ndvi',  scale: 30,  region: AOI,  fileFormat: 'GeoTIFF',
   formatOptions: {    cloudOptimized: true  }
 });
 
-// Export mean of NDVI differences as GeoTIFF
+// Export post-event mean of median NDVIs as GeoTIFF
+Export.image.toDrive({ 
+  image: Spost,  description: 'mean_ndsi',  scale: 30,  region: AOI,  fileFormat: 'GeoTIFF',
+  formatOptions: {    cloudOptimized: true  }
+});
+
+// Export mean of NDVI differences (dV) as GeoTIFF
 Export.image.toDrive({
-  image: mean_ndviDiff,  description: 'ndvi_diff',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  image: dV,  description: 'ndvi_diff',  scale: 30,  region: AOI,  fileFormat: 'GeoTIFF',
   formatOptions: {    cloudOptimized: true  }
 });
 
 // Export t statistic as GeoTIFF
 Export.image.toDrive({
-  image: t_stat,  description: 't_statistic',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  image: t_stat,  description: 't_statistic',  scale: 30,  region: AOI,  fileFormat: 'GeoTIFF',
   formatOptions: {    cloudOptimized: true  }
 });
 
-// Export predictions based on NDVIdiff (commented for speed)
+// Export Pt as GeoTIFF
 Export.image.toDrive({
-  image: ALDI,  description: 'ALDI',  scale: 30,  region: AOIpoint,  fileFormat: 'GeoTIFF',
+  image: Pt,  description: 'Pt',  scale: 30,  region: AOI,  fileFormat: 'GeoTIFF',
+  formatOptions: {    cloudOptimized: true  }
+});
+
+// Export ALDI classification surface as GeoTIFF
+Export.image.toDrive({
+  image: ALDI,  description: 'ALDI',  scale: 30,  region: AOI,  fileFormat: 'GeoTIFF',
   formatOptions: {    cloudOptimized: true  }
 });
